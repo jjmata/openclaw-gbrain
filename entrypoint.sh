@@ -45,46 +45,68 @@ SQL
 #    The init wizard normally prompts for a connection URL; passing --url
 #    skips the wizard and writes config to $GBRAIN_HOME/config.json.
 #
-#    Known issue on Render Managed Postgres: GBrain migration v24
-#    (rls_backfill_missing_tables) requires the connecting role to hold the
-#    BYPASSRLS attribute. Render never grants BYPASSRLS to user roles
-#    (only the platform's superuser has it), so v24 throws and aborts the
-#    whole init. See https://github.com/garrytan/gbrain/issues/416 for the
-#    upstream design discussion.
+#    Known issue on Render Managed Postgres: several GBrain migrations
+#    (v24, v29, v31, v35 at the time of writing) require the connecting
+#    role to hold the BYPASSRLS attribute. Render never grants BYPASSRLS
+#    to user roles (only the platform's superuser has it), so each of
+#    these migrations throws and aborts the whole init. See
+#    https://github.com/garrytan/gbrain/issues/416 for the upstream
+#    design discussion.
 #
-#    The migration is a no-op for this template's threat model: it enables
-#    RLS on 10 tables that are only readable via the gbrain role, which
-#    owns the tables (Postgres table owners bypass RLS by default) and is
-#    not exposed via PostgREST. We detect the failure, mark v24 as applied
-#    in gbrain's `config` table, and re-run init to apply v25+ normally.
+#    These migrations are no-ops for this template's threat model: they
+#    only enable RLS on tables that are exclusively read via the gbrain
+#    role, which owns them (Postgres table owners bypass RLS by default)
+#    and is not exposed via PostgREST. We detect each failure, mark the
+#    offending migration as applied in gbrain's `config` table, and
+#    re-run init. The loop terminates when init succeeds or when a
+#    failure occurs that we don't recognise.
 # ---------------------------------------------------------------------------
 run_gbrain_init() {
   local log_file="/tmp/gbrain-init.$$.log"
-  if gbrain init --url "$DATABASE_URL" --non-interactive 2>&1 | tee "$log_file"; then
+  local max_iterations=20
+  local iteration=0
+
+  while [ "$iteration" -lt "$max_iterations" ]; do
+    iteration=$((iteration + 1))
+
+    if gbrain init --url "$DATABASE_URL" --non-interactive 2>&1 | tee "$log_file"; then
+      rm -f "$log_file"
+      return 0
+    fi
+
+    if ! grep -q 'BYPASSRLS privilege' "$log_file"; then
+      log "ERROR: gbrain init failed for a reason other than the known BYPASSRLS limitation. See output above."
+      rm -f "$log_file"
+      return 1
+    fi
+
+    local stuck_version
+    stuck_version="$(grep 'BYPASSRLS privilege' "$log_file" | grep -oE 'v[0-9]+' | head -n1 | tr -d 'v')"
+    if [ -z "$stuck_version" ]; then
+      log "ERROR: could not parse stuck migration version from gbrain output."
+      rm -f "$log_file"
+      return 1
+    fi
+
+    local current_version expected_prev
+    current_version="$(psql "$DATABASE_URL" -tAc "SELECT value FROM config WHERE key='version'" 2>/dev/null | tr -d '[:space:]')"
+    expected_prev=$((stuck_version - 1))
+    if [ "$current_version" != "$expected_prev" ]; then
+      log "ERROR: gbrain init failed at v${stuck_version} but schema version is '${current_version:-<unset>}' (expected ${expected_prev}). Aborting to avoid masking an unrelated issue."
+      rm -f "$log_file"
+      return 1
+    fi
+
+    log "Iteration ${iteration}: marking v${stuck_version} as applied (RLS no-op on Render — gbrain role owns the tables and is not exposed via PostgREST)."
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+      -c "UPDATE config SET value='${stuck_version}' WHERE key='version' AND value='${expected_prev}';" >/dev/null
+
+    log "Re-running gbrain init to apply remaining migrations..."
     rm -f "$log_file"
-    return 0
-  fi
+  done
 
-  if ! grep -q 'BYPASSRLS' "$log_file"; then
-    log "ERROR: gbrain init failed for a reason other than the known BYPASSRLS limitation. See output above."
-    rm -f "$log_file"
-    return 1
-  fi
-
-  local current_version
-  current_version="$(psql "$DATABASE_URL" -tAc "SELECT value FROM config WHERE key='version'" 2>/dev/null | tr -d '[:space:]')"
-  if [ "$current_version" != "23" ]; then
-    log "ERROR: gbrain init failed at unexpected schema version: '${current_version:-<unset>}' (expected 23 if BYPASSRLS was the only issue)."
-    rm -f "$log_file"
-    return 1
-  fi
-
-  log "Detected gbrain v24 BYPASSRLS limitation. Marking v24 as applied (RLS no-op on Render: gbrain role owns tables and is not exposed via PostgREST)."
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE config SET value='24' WHERE key='version' AND value='23';" >/dev/null
-
-  log "Re-running gbrain init to apply remaining migrations..."
-  rm -f "$log_file"
-  gbrain init --url "$DATABASE_URL" --non-interactive
+  log "ERROR: hit max BYPASSRLS workaround iterations (${max_iterations}). Investigate manually."
+  return 1
 }
 
 if [ ! -f "${GBRAIN_HOME:-/data/.gbrain}/config.json" ]; then
