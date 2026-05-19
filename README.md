@@ -15,10 +15,22 @@ One-click Render deploy for [OpenClaw](https://github.com/openclaw/openclaw) wra
 
 | Resource | Plan | Notes |
 | --- | --- | --- |
-| Web service (Docker) | Standard (2 GB) | AlphaClaw + OpenClaw + GBrain CLI. Standard is the minimum that fits the gateway without OOM. |
+| Web service (Docker) | Pro (4 GB) | AlphaClaw + OpenClaw + GBrain CLI + PGLite brain in-process. Pro gives ~50% headroom over OpenClaw's 2 GB minimum and survives bulk ingestion spikes. |
 | Persistent disk | 10 GB at `/data` | AlphaClaw state, OpenClaw memory index, GBrain PGLite brain file, GBrain config. |
 
-Estimated cost: about $25/mo for Standard web + 10 GB disk at current Render pricing. Compare to AlphaClaw on Railway + Supabase Pro at ~$85/mo + $25/mo. Check [render.com/pricing](https://render.com/pricing) for current rates.
+Check [render.com/pricing](https://render.com/pricing) for current rates.
+
+### Sizing guidance
+
+PGLite runs in the same process as the OpenClaw gateway, so memory pressure scales with brain size on top of the gateway baseline. Rough guidance:
+
+| Brain size | Recommended plan |
+| --- | --- |
+| Empty / demo (< 500 pages) | Standard (2 GB) — try-it-out only |
+| Small to medium (up to a few thousand pages) | Pro (4 GB) — the template default |
+| Large (10k+ pages, regular bulk ingest) | Pro Plus (8 GB) or higher |
+
+Watch the **Metrics** tab after a week of real use. If sustained memory creeps above ~75%, bump the plan — vertical scaling is your only option here (the persistent disk caps you at one instance).
 
 ## Before you deploy
 
@@ -71,7 +83,7 @@ Binary attachments (images, PDFs, audio) are not supported on this template. GBr
 
 ```
 .
-├── render.yaml         # Render Blueprint: web service + disk (project-grouped)
+├── render.yaml         # Render Blueprint: single web service + disk
 ├── Dockerfile          # AlphaClaw (Node) + GBrain (Bun, installed from GitHub)
 ├── entrypoint.sh       # gbrain init (PGLite), skills seed, exec alphaclaw
 ├── package.json        # Pins @chrysb/alphaclaw
@@ -94,7 +106,9 @@ PGLite ([@electric-sql/pglite](https://github.com/electric-sql/pglite)) is GBrai
 
 ## Troubleshooting
 
-**Container OOMs on startup.** The Standard plan (2 GB) is the floor for OpenClaw's gateway. Do not downgrade to Starter.
+**Container OOMs on startup.** Standard (2 GB) is the floor for OpenClaw's gateway alone; do not downgrade to Starter. The template defaults to Pro (4 GB) because PGLite runs in the same process. If you're on Standard and seeing OOMs, bump to Pro.
+
+**Container OOMs during ingestion.** Bulk ingest (importing thousands of pages at once) is the peak-memory moment for this template. Embedding batches plus PGLite working memory can push past 4 GB on a large brain. Either ingest in smaller batches, or temporarily scale up to Pro Plus (8 GB) for the initial seed and scale back to Pro afterward.
 
 **Embeddings stuck at 0.** Check the service logs for OpenAI rate limit errors. GBrain backs off automatically. If `OPENAI_API_KEY` is missing or invalid, search still works in keyword-only mode.
 
