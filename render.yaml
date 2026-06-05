@@ -25,7 +25,7 @@ services:
       - key: ALPHACLAW_ROOT_DIR
         value: /data
       - key: SETUP_PASSWORD
-        generateValue: false
+        sync: false
       - key: OPENCLAW_GATEWAY_TOKEN
         generateValue: true
       - key: PORT
